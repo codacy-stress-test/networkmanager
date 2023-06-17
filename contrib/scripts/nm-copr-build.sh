@@ -1,6 +1,27 @@
 #!/bin/bash
 
-# environment variables:
+# This is the build script used by our copr repository at
+#   https://copr.fedorainfracloud.org/coprs/networkmanager
+#
+# On a new upstream release, add new copr jobs named "NetworkManager-X.Y" and
+# "NetworkManager-X.Y-debug".
+#
+#   - best, look at the latest copr project and replicate the settings.
+#   - add a custom build with the following script:
+#
+#        #!/bin/bash
+#        export GIT_REF=nm-$X-$Y
+#        export DEBUG=0/1
+#        export LTO=
+#        curl https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/raw/main/contrib/scripts/nm-copr-build.sh | bash
+#
+#   - for certain CentOS/EPEL you need to add https://copr.fedorainfracloud.org/coprs/nmstate/nm-build-deps/
+#     as build chroot. See under "Settings/Project Details" for the latest copr project.
+#   - go to "Settings/Integrations" and find the notification URL for the project. Then
+#     go to https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/hooks and add
+#     a push event for the "nm-$X-$Y" branch.
+#
+# environment variables for this script:
 # - GIT_REF: the ref that should be build. Can be "main" or a git sha.
 # - DEBUG: set to 1 to build "--with debug". Otherwise the default is a release
 #     build.
@@ -8,6 +29,8 @@
 #     on the distribution.
 # - NM_GIT_BUNDLE: set to a HTTP url where to fetch the nm-git-bundle-*.noarch.rpm
 #     from. Set to empty to skip it. By default, it fetches the bundle from copr.
+#     See "contrib/scripts/nm-copr-build-nm-git-bundle.sh" script and
+#     https://copr.fedorainfracloud.org/coprs/networkmanager/NetworkManager-main/package/nm-git-bundle/
 
 set -ex
 
@@ -47,7 +70,7 @@ get_nm_git_bundle() {
         if [ -n "${NM_GIT_BUNDLE+x}" ]; then
             return 0
         fi
-        NM_GIT_BUNDLE='https://download.copr.fedorainfracloud.org/results/networkmanager/NetworkManager-main/fedora-37-x86_64/05157676-nm-git-bundle/nm-git-bundle-20221220-102417.noarch.rpm'
+        NM_GIT_BUNDLE='https://download.copr.fedorainfracloud.org/results/networkmanager/NetworkManager-main/fedora-38-x86_64/06008259-nm-git-bundle/nm-git-bundle-20230606-102458.noarch.rpm'
     fi
     mkdir nm-git-bundle
     pushd nm-git-bundle

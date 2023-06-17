@@ -91,8 +91,8 @@
 
 #define GRACE_PERIOD_MULTIPLIER 2U
 
-#define CARRIER_WAIT_TIME_MS           6000
-#define CARRIER_WAIT_TIME_AFTER_MTU_MS 10000
+#define CARRIER_WAIT_TIME_MS             6000
+#define CARRIER_WAIT_TIME_AFTER_MTU_MSEC 10000
 
 #define NM_DEVICE_AUTH_RETRIES_UNSET    -1
 #define NM_DEVICE_AUTH_RETRIES_INFINITY -2
@@ -536,10 +536,10 @@ typedef struct _NMDevicePrivate {
     /* Link stuff */
     guint             link_connected_id;
     guint             link_disconnected_id;
-    guint             carrier_defer_id;
-    guint             carrier_wait_id;
     gulong            config_changed_id;
     gulong            ifindex_changed_id;
+    GSource          *carrier_wait_source;
+    GSource          *carrier_defer_source;
     guint32           mtu;
     guint32           ip6_mtu; /* FIXME(l3cfg) */
     guint32           mtu_initial;
@@ -553,9 +553,9 @@ typedef struct _NMDevicePrivate {
      * until taking action.
      *
      * When changing MTU, the device might take longer then that. So, whenever
-     * NM changes the MTU it sets @carrier_wait_until_ms to CARRIER_WAIT_TIME_AFTER_MTU_MS
+     * NM changes the MTU it sets @carrier_wait_until_msec to CARRIER_WAIT_TIME_AFTER_MTU_MSEC
      * in the future. This is used to extend the grace period in this particular case. */
-    gint64 carrier_wait_until_ms;
+    gint64 carrier_wait_until_msec;
 
     union {
         struct {
@@ -5116,6 +5116,18 @@ nm_device_get_ip_iface_identifier(NMDevice           *self,
 }
 
 const char *
+nm_device_get_s390_subchannels(NMDevice *self)
+{
+    NMDeviceClass *klass;
+
+    g_return_val_if_fail(NM_IS_DEVICE(self), NULL);
+
+    klass = NM_DEVICE_GET_CLASS(self);
+
+    return klass->get_s390_subchannels ? klass->get_s390_subchannels(self) : NULL;
+}
+
+const char *
 nm_device_get_driver(NMDevice *self)
 {
     g_return_val_if_fail(self != NULL, NULL);
@@ -5400,13 +5412,31 @@ nm_device_get_type_desc(NMDevice *self)
 }
 
 const char *
+nm_device_get_type_desc_for_log(NMDevice *self)
+{
+    const char *type;
+
+    type = nm_device_get_type_desc(self);
+
+    /* Some OVS device types (ports and bridges) are not backed by a kernel link, and
+     * they can have the same name of another device of a different type. In fact, it's
+     * quite common to assign the same name to the OVS bridge, the OVS port and the OVS
+     * interface. For this reason, also log the type in case of OVS devices to make the
+     * log message unambiguous. */
+    if (NM_STR_HAS_PREFIX(type, "Open vSwitch"))
+        return type;
+
+    return NULL;
+}
+
+const char *
 nm_device_get_type_description(NMDevice *self)
 {
     g_return_val_if_fail(self != NULL, NULL);
 
     /* Beware: this function should return the same
-     * value as nm_device_get_type_description() in libnm. */
-
+     * value as nm_device_get_type_description() in libnm.
+     * The returned string is static or interned */
     return NM_DEVICE_GET_CLASS(self)->get_type_description(self);
 }
 
@@ -6609,6 +6639,8 @@ carrier_changed(NMDevice *self, gboolean carrier)
     }
 
     if (carrier) {
+        gboolean recheck_auto_activate = FALSE;
+
         if (priv->state == NM_DEVICE_STATE_UNAVAILABLE) {
             nm_device_queue_state(self,
                                   NM_DEVICE_STATE_DISCONNECTED,
@@ -6619,8 +6651,18 @@ carrier_changed(NMDevice *self, gboolean carrier)
              * when the carrier appears, auto connections are rechecked for
              * the device.
              */
-            nm_device_recheck_auto_activate_schedule(self);
+            recheck_auto_activate = TRUE;
         }
+        if (nm_manager_devcon_autoconnect_blocked_reason_set(
+                nm_device_get_manager(self),
+                self,
+                NULL,
+                NM_SETTINGS_AUTOCONNECT_BLOCKED_REASON_FAILED,
+                FALSE))
+            recheck_auto_activate = TRUE;
+
+        if (recheck_auto_activate)
+            nm_device_recheck_auto_activate_schedule(self);
     } else {
         if (priv->state == NM_DEVICE_STATE_UNAVAILABLE) {
             if (priv->queued_state.id && priv->queued_state.state >= NM_DEVICE_STATE_DISCONNECTED)
@@ -6639,24 +6681,20 @@ carrier_disconnected_action_cb(gpointer user_data)
     NMDevice        *self = NM_DEVICE(user_data);
     NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE(self);
 
-    _LOGD(LOGD_DEVICE,
-          "carrier: link disconnected (calling deferred action) (id=%u)",
-          priv->carrier_defer_id);
+    _LOGD(LOGD_DEVICE, "carrier: link disconnected (calling deferred action)");
 
-    priv->carrier_defer_id = 0;
+    nm_clear_g_source_inst(&priv->carrier_defer_source);
     carrier_changed(self, FALSE);
-    return FALSE;
+    return G_SOURCE_CONTINUE;
 }
 
 static void
 carrier_disconnected_action_cancel(NMDevice *self)
 {
     NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE(self);
-    guint            id   = priv->carrier_defer_id;
 
-    if (nm_clear_g_source(&priv->carrier_defer_id)) {
-        _LOGD(LOGD_DEVICE, "carrier: link disconnected (canceling deferred action) (id=%u)", id);
-    }
+    if (nm_clear_g_source_inst(&priv->carrier_defer_source))
+        _LOGD(LOGD_DEVICE, "carrier: link disconnected (canceling deferred action)");
 }
 
 void
@@ -6684,28 +6722,29 @@ nm_device_set_carrier(NMDevice *self, gboolean carrier)
         NM_DEVICE_GET_CLASS(self)->carrier_changed_notify(self, carrier);
         carrier_changed(self, TRUE);
 
-        if (priv->carrier_wait_id) {
+        if (priv->carrier_wait_source) {
             nm_device_remove_pending_action(self, NM_PENDING_ACTION_CARRIER_WAIT, FALSE);
             _carrier_wait_check_queued_act_request(self);
         }
     } else {
-        if (priv->carrier_wait_id)
+        if (priv->carrier_wait_source)
             nm_device_add_pending_action(self, NM_PENDING_ACTION_CARRIER_WAIT, FALSE);
         NM_DEVICE_GET_CLASS(self)->carrier_changed_notify(self, carrier);
         if (state <= NM_DEVICE_STATE_DISCONNECTED && !priv->queued_act_request) {
             _LOGD(LOGD_DEVICE, "carrier: link disconnected");
+            carrier_disconnected_action_cancel(self);
             carrier_changed(self, FALSE);
-        } else {
-            gint64 now_ms, until_ms;
+        } else if (!priv->carrier_defer_source) {
+            gint64 until_ms;
+            gint64 now_ms;
 
             now_ms   = nm_utils_get_monotonic_timestamp_msec();
-            until_ms = NM_MAX(now_ms + _get_carrier_wait_ms(self), priv->carrier_wait_until_ms);
-            priv->carrier_defer_id =
-                g_timeout_add(until_ms - now_ms, carrier_disconnected_action_cb, self);
+            until_ms = NM_MAX(now_ms + _get_carrier_wait_ms(self), priv->carrier_wait_until_msec);
+            priv->carrier_defer_source =
+                nm_g_timeout_add_source(until_ms - now_ms, carrier_disconnected_action_cb, self);
             _LOGD(LOGD_DEVICE,
-                  "carrier: link disconnected (deferring action for %ld milliseconds) (id=%u)",
-                  (long) (until_ms - now_ms),
-                  priv->carrier_defer_id);
+                  "carrier: link disconnected (deferring action for %ld milliseconds)",
+                  (long) (until_ms - now_ms));
         }
     }
 }
@@ -7493,14 +7532,15 @@ device_init_static_sriov_num_vfs(NMDevice *self)
     if (priv->ifindex > 0 && nm_device_has_capability(self, NM_DEVICE_CAP_SRIOV)) {
         int num_vfs;
 
-        num_vfs = nm_config_data_get_device_config_int64(NM_CONFIG_GET_DATA,
-                                                         NM_CONFIG_KEYFILE_KEY_DEVICE_SRIOV_NUM_VFS,
-                                                         self,
-                                                         10,
-                                                         0,
-                                                         G_MAXINT32,
-                                                         -1,
-                                                         -1);
+        num_vfs = nm_config_data_get_device_config_int64_by_device(
+            NM_CONFIG_GET_DATA,
+            NM_CONFIG_KEYFILE_KEY_DEVICE_SRIOV_NUM_VFS,
+            self,
+            10,
+            0,
+            G_MAXINT32,
+            -1,
+            -1);
         if (num_vfs >= 0)
             sriov_op_queue(self, num_vfs, NM_OPTION_BOOL_DEFAULT, NULL, NULL);
     }
@@ -7516,7 +7556,7 @@ config_changed(NMConfig           *config,
     NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE(self);
 
     if (priv->state <= NM_DEVICE_STATE_DISCONNECTED || priv->state >= NM_DEVICE_STATE_ACTIVATED) {
-        priv->ignore_carrier = nm_config_data_get_ignore_carrier(config_data, self);
+        priv->ignore_carrier = nm_config_data_get_ignore_carrier_by_device(config_data, self);
         if (NM_FLAGS_HAS(changes, NM_CONFIG_CHANGE_VALUES)
             && !nm_device_get_applied_setting(self, NM_TYPE_SETTING_SRIOV))
             device_init_static_sriov_num_vfs(self);
@@ -7655,8 +7695,9 @@ realize_start_setup(NMDevice             *self,
     nm_device_update_permanent_hw_address(self, FALSE);
 
     /* Note: initial hardware address must be read before calling get_ignore_carrier() */
-    config               = nm_config_get();
-    priv->ignore_carrier = nm_config_data_get_ignore_carrier(nm_config_get_data(config), self);
+    config = nm_config_get();
+    priv->ignore_carrier =
+        nm_config_data_get_ignore_carrier_by_device(nm_config_get_data(config), self);
     if (!priv->config_changed_id) {
         priv->config_changed_id = g_signal_connect(config,
                                                    NM_CONFIG_SIGNAL_CONFIG_CHANGED,
@@ -10661,6 +10702,7 @@ _dev_ipdhcpx_start(NMDevice *self, int addr_family)
             .addr_family             = AF_INET,
             .l3cfg                   = nm_device_get_l3cfg(self),
             .iface                   = nm_device_get_ip_iface(self),
+            .iface_type_log          = nm_device_get_type_desc_for_log(self),
             .uuid                    = nm_connection_get_uuid(connection),
             .hwaddr                  = hwaddr,
             .bcast_hwaddr            = bcast_hwaddr,
@@ -10698,6 +10740,7 @@ _dev_ipdhcpx_start(NMDevice *self, int addr_family)
             .addr_family     = AF_INET6,
             .l3cfg           = nm_device_get_l3cfg(self),
             .iface           = nm_device_get_ip_iface(self),
+            .iface_type_log  = nm_device_get_type_desc_for_log(self),
             .uuid            = nm_connection_get_uuid(connection),
             .send_hostname   = nm_setting_ip_config_get_dhcp_send_hostname(s_ip),
             .hostname        = nm_setting_ip_config_get_dhcp_hostname(s_ip),
@@ -10885,10 +10928,13 @@ connection_ip_method_requires_carrier(NMConnection *connection,
 static gboolean
 connection_requires_carrier(NMConnection *connection)
 {
-    NMSettingIPConfig   *s_ip4, *s_ip6;
+    NMSettingIPConfig   *s_ip4;
+    NMSettingIPConfig   *s_ip6;
     NMSettingConnection *s_con;
-    gboolean             ip4_carrier_wanted, ip6_carrier_wanted;
-    gboolean             ip4_used = FALSE, ip6_used = FALSE;
+    gboolean             ip4_carrier_wanted;
+    gboolean             ip6_carrier_wanted;
+    gboolean             ip4_used = FALSE;
+    gboolean             ip6_used = FALSE;
 
     /* We can progress to IP_CONFIG now, so that we're enslaved.
      * That may actually cause carrier to go up and thus continue activation. */
@@ -11581,8 +11627,8 @@ _commit_mtu(NMDevice *self)
                                  ? "Are the MTU sizes of the slaves large enough?"
                                  : "Did you configure the MTU correctly?"));
             }
-            priv->carrier_wait_until_ms =
-                nm_utils_get_monotonic_timestamp_msec() + CARRIER_WAIT_TIME_AFTER_MTU_MS;
+            priv->carrier_wait_until_msec =
+                nm_utils_get_monotonic_timestamp_msec() + CARRIER_WAIT_TIME_AFTER_MTU_MSEC;
         }
 
         if (ip6_mtu && ip6_mtu != _IP6_MTU_SYS()) {
@@ -11611,8 +11657,8 @@ _commit_mtu(NMDevice *self)
                        msg ? ": " : "",
                        msg ?: "");
             }
-            priv->carrier_wait_until_ms =
-                nm_utils_get_monotonic_timestamp_msec() + CARRIER_WAIT_TIME_AFTER_MTU_MS;
+            priv->carrier_wait_until_msec =
+                nm_utils_get_monotonic_timestamp_msec() + CARRIER_WAIT_TIME_AFTER_MTU_MSEC;
         }
     }
 
@@ -11898,7 +11944,7 @@ _dev_ipac6_start(NMDevice *self)
 
         sysctl_value = nm_device_sysctl_ip_conf_get(self, AF_INET6, "forwarding");
         if (!nm_streq0(sysctl_value, "1")) {
-            if (sysctl_value) {
+            if (sysctl_value && !g_hash_table_contains(priv->ip6_saved_properties, "forwarding")) {
                 g_hash_table_insert(priv->ip6_saved_properties,
                                     "forwarding",
                                     g_steal_pointer(&sysctl_value));
@@ -13094,6 +13140,7 @@ check_and_reapply_connection(NMDevice            *self,
     NMConnection                  *con_old;
     NMConnection                  *con_new;
     GHashTableIter                 iter;
+    NMSettingsConnection          *sett_conn;
 
     if (priv->state < NM_DEVICE_STATE_PREPARE || priv->state > NM_DEVICE_STATE_ACTIVATED) {
         g_set_error_literal(error,
@@ -13267,6 +13314,14 @@ check_and_reapply_connection(NMDevice            *self,
 
     if (priv->state >= NM_DEVICE_STATE_ACTIVATED)
         nm_device_update_metered(self);
+
+    sett_conn = nm_device_get_settings_connection(self);
+    if (sett_conn) {
+        nm_settings_connection_autoconnect_blocked_reason_set(
+            sett_conn,
+            NM_SETTINGS_AUTOCONNECT_BLOCKED_REASON_USER_REQUEST,
+            FALSE);
+    }
 
     /* Notify dispatcher when re-applied */
     _LOGD(LOGD_DEVICE, "Notifying re-apply complete");
@@ -13741,7 +13796,7 @@ _carrier_wait_check_act_request_must_queue(NMDevice *self, NMActRequest *req)
      * request is not blocked waiting for carrier. */
     if (priv->carrier)
         return FALSE;
-    if (priv->carrier_wait_id == 0)
+    if (!priv->carrier_wait_source)
         return FALSE;
 
     connection = nm_act_request_get_applied_connection(req);
@@ -14255,11 +14310,11 @@ carrier_wait_timeout(gpointer user_data)
     NMDevice        *self = NM_DEVICE(user_data);
     NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE(self);
 
-    priv->carrier_wait_id = 0;
+    nm_clear_g_source_inst(&priv->carrier_wait_source);
     nm_device_remove_pending_action(self, NM_PENDING_ACTION_CARRIER_WAIT, FALSE);
     if (!priv->carrier)
         _carrier_wait_check_queued_act_request(self);
-    return G_SOURCE_REMOVE;
+    return G_SOURCE_CONTINUE;
 }
 
 static gboolean
@@ -14276,14 +14331,15 @@ nm_device_is_up(NMDevice *self)
 static gint64
 _get_carrier_wait_ms(NMDevice *self)
 {
-    return nm_config_data_get_device_config_int64(NM_CONFIG_GET_DATA,
-                                                  NM_CONFIG_KEYFILE_KEY_DEVICE_CARRIER_WAIT_TIMEOUT,
-                                                  self,
-                                                  10,
-                                                  0,
-                                                  G_MAXINT32,
-                                                  CARRIER_WAIT_TIME_MS,
-                                                  CARRIER_WAIT_TIME_MS);
+    return nm_config_data_get_device_config_int64_by_device(
+        NM_CONFIG_GET_DATA,
+        NM_CONFIG_KEYFILE_KEY_DEVICE_CARRIER_WAIT_TIMEOUT,
+        self,
+        10,
+        0,
+        G_MAXINT32,
+        CARRIER_WAIT_TIME_MS,
+        CARRIER_WAIT_TIME_MS);
 }
 
 /*
@@ -14306,13 +14362,14 @@ carrier_detect_wait(NMDevice *self)
      *
      * If during that time carrier goes away, we declare the interface
      * as not ready. */
-    nm_clear_g_source(&priv->carrier_wait_id);
+    nm_clear_g_source_inst(&priv->carrier_wait_source);
     if (!priv->carrier)
         nm_device_add_pending_action(self, NM_PENDING_ACTION_CARRIER_WAIT, FALSE);
 
     now_ms   = nm_utils_get_monotonic_timestamp_msec();
-    until_ms = NM_MAX(now_ms + _get_carrier_wait_ms(self), priv->carrier_wait_until_ms);
-    priv->carrier_wait_id = g_timeout_add(until_ms - now_ms, carrier_wait_timeout, self);
+    until_ms = NM_MAX(now_ms + _get_carrier_wait_ms(self), priv->carrier_wait_until_msec);
+    priv->carrier_wait_source =
+        nm_g_timeout_add_source(until_ms - now_ms, carrier_wait_timeout, self);
 }
 
 gboolean
@@ -14839,11 +14896,11 @@ nm_device_check_unrealized_device_managed(NMDevice *self)
 
     nm_assert(!nm_device_is_real(self));
 
-    if (!nm_config_data_get_device_config_boolean(NM_CONFIG_GET_DATA,
-                                                  NM_CONFIG_KEYFILE_KEY_DEVICE_MANAGED,
-                                                  self,
-                                                  TRUE,
-                                                  TRUE))
+    if (!nm_config_data_get_device_config_boolean_by_device(NM_CONFIG_GET_DATA,
+                                                            NM_CONFIG_KEYFILE_KEY_DEVICE_MANAGED,
+                                                            self,
+                                                            TRUE,
+                                                            TRUE))
         return FALSE;
 
     if (nm_device_spec_match_list(self, nm_settings_get_unmanaged_specs(priv->settings)))
@@ -14910,11 +14967,11 @@ nm_device_set_unmanaged_by_user_conf(NMDevice *self)
     gboolean      value;
     NMUnmanFlagOp set_op;
 
-    value = nm_config_data_get_device_config_boolean(NM_CONFIG_GET_DATA,
-                                                     NM_CONFIG_KEYFILE_KEY_DEVICE_MANAGED,
-                                                     self,
-                                                     -1,
-                                                     TRUE);
+    value = nm_config_data_get_device_config_boolean_by_device(NM_CONFIG_GET_DATA,
+                                                               NM_CONFIG_KEYFILE_KEY_DEVICE_MANAGED,
+                                                               self,
+                                                               -1,
+                                                               TRUE);
     switch (value) {
     case TRUE:
         set_op = NM_UNMAN_FLAG_OP_SET_MANAGED;
@@ -15297,14 +15354,11 @@ check_connection_available(NMDevice                      *self,
 {
     NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE(self);
 
-    /* Connections which require a network connection are not available when
-     * the device has no carrier, even with ignore-carrer=TRUE.
-     */
-    if (priv->carrier || !connection_requires_carrier(connection))
+    if (priv->carrier)
         return TRUE;
 
     if (NM_FLAGS_HAS(flags, _NM_DEVICE_CHECK_CON_AVAILABLE_FOR_USER_REQUEST_WAITING_CARRIER)
-        && priv->carrier_wait_id != 0) {
+        && priv->carrier_wait_source) {
         /* The device has no carrier though the connection requires it.
          *
          * If we are still waiting for carrier, the connection is available
@@ -15312,18 +15366,24 @@ check_connection_available(NMDevice                      *self,
         return TRUE;
     }
 
-    /* master types are always available even without carrier.
-     * Making connection non-available would un-enslave slaves which
-     * is not desired. */
-    if (nm_device_is_master(self))
-        return TRUE;
-
     if (!priv->up) {
         /* If the device is !IFF_UP it also has no carrier. But we assume that if we
          * would start activating the device (and thereby set the device IFF_UP),
          * that we would get a carrier. We only know after we set the device up,
          * and we only set it up after we start activating it. So presumably, this
          * profile would be available (but we just don't know). */
+        return TRUE;
+    }
+
+    if (!connection_requires_carrier(connection)) {
+        /* Connections that don't require carrier are available. */
+        return TRUE;
+    }
+
+    if (nm_device_is_master(self)) {
+        /* master types are always available even without carrier.
+         * Making connection non-available would un-enslave slaves which
+         * is not desired. */
         return TRUE;
     }
 
@@ -15836,8 +15896,8 @@ nm_device_cleanup(NMDevice *self, NMDeviceStateReason reason, CleanupType cleanu
                   ifindex);
             if (priv->mtu_initial) {
                 nm_platform_link_set_mtu(nm_device_get_platform(self), ifindex, priv->mtu_initial);
-                priv->carrier_wait_until_ms =
-                    nm_utils_get_monotonic_timestamp_msec() + CARRIER_WAIT_TIME_AFTER_MTU_MS;
+                priv->carrier_wait_until_msec =
+                    nm_utils_get_monotonic_timestamp_msec() + CARRIER_WAIT_TIME_AFTER_MTU_MSEC;
             }
             if (priv->ip6_mtu_initial) {
                 char sbuf[64];
@@ -16256,7 +16316,8 @@ _set_state_full(NMDevice *self, NMDeviceState state, NMDeviceStateReason reason,
 
         /* We cache the ignore_carrier state to not react on config-reloads while the connection
          * is active. But on deactivating, reset the ignore-carrier flag to the current state. */
-        priv->ignore_carrier = nm_config_data_get_ignore_carrier(NM_CONFIG_GET_DATA, self);
+        priv->ignore_carrier =
+            nm_config_data_get_ignore_carrier_by_device(NM_CONFIG_GET_DATA, self);
 
         if (quitting) {
             nm_dispatcher_call_device_sync(NM_DISPATCHER_ACTION_PRE_DOWN, self, req);
@@ -17248,38 +17309,11 @@ nm_device_spec_match_list(NMDevice *self, const GSList *specs)
 int
 nm_device_spec_match_list_full(NMDevice *self, const GSList *specs, int no_match_value)
 {
-    NMDeviceClass       *klass;
-    NMMatchSpecMatchType m;
-    const char          *hw_address = NULL;
-    gboolean             is_fake;
+    NMMatchSpecDeviceData data;
+    NMMatchSpecMatchType  m;
 
-    g_return_val_if_fail(NM_IS_DEVICE(self), FALSE);
-
-    klass      = NM_DEVICE_GET_CLASS(self);
-    hw_address = nm_device_get_permanent_hw_address_full(
-        self,
-        !nm_device_get_unmanaged_flags(self, NM_UNMANAGED_PLATFORM_INIT),
-        &is_fake);
-
-    m = nm_match_spec_device(specs,
-                             nm_device_get_iface(self),
-                             nm_device_get_type_description(self),
-                             nm_device_get_driver(self),
-                             nm_device_get_driver_version(self),
-                             is_fake ? NULL : hw_address,
-                             klass->get_s390_subchannels ? klass->get_s390_subchannels(self) : NULL,
-                             nm_dhcp_manager_get_config(nm_dhcp_manager_get()));
-
-    switch (m) {
-    case NM_MATCH_SPEC_MATCH:
-        return TRUE;
-    case NM_MATCH_SPEC_NEG_MATCH:
-        return FALSE;
-    case NM_MATCH_SPEC_NO_MATCH:
-        return no_match_value;
-    }
-    nm_assert_not_reached();
-    return no_match_value;
+    m = nm_match_spec_device(specs, nm_match_spec_device_data_init_from_device(&data, self));
+    return nm_match_spec_match_type_to_bool(m, no_match_value);
 }
 
 guint
@@ -18154,7 +18188,7 @@ dispose(GObject *object)
 
     available_connections_del_all(self);
 
-    if (nm_clear_g_source(&priv->carrier_wait_id))
+    if (nm_clear_g_source_inst(&priv->carrier_wait_source))
         nm_device_remove_pending_action(self, NM_PENDING_ACTION_CARRIER_WAIT, FALSE);
 
     _clear_queued_act_request(priv, NM_ACTIVE_CONNECTION_STATE_REASON_DEVICE_DISCONNECTED);

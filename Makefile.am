@@ -3349,6 +3349,12 @@ src_core_ppp_libnm_ppp_plugin_la_LIBADD = \
 
 $(src_core_ppp_libnm_ppp_plugin_la_OBJECTS): $(src_libnm_core_public_mkenums_h)
 
+check-local-ppp-plugin: src/core/NetworkManager src/core/ppp/libnm-ppp-plugin.la
+	$(srcdir)/tools/check-exports.sh $(builddir)/src/core/ppp/.libs/libnm-ppp-plugin.so "$(srcdir)/src/core/ppp/nm-ppp-plugin.ver"
+	$(call check_so_symbols,$(builddir)/src/core/ppp/.libs/libnm-ppp-plugin.so)
+
+check_local += check-local-ppp-plugin
+
 endif
 
 EXTRA_DIST += \
@@ -3583,7 +3589,9 @@ EXTRA_DIST += \
 	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-fcoe-fabric \
 	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-fcoe-vn2vn \
 	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-ibft \
-	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-infiniband \
+	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-infiniband0 \
+	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-infiniband1 \
+	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-infiniband2 \
 	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-ip6-disabled.cexpected \
 	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-ipoib \
 	src/core/settings/plugins/ifcfg-rh/tests/network-scripts/ifcfg-test-link_local \
@@ -5198,6 +5206,8 @@ src_nmtui_nmtui_SOURCES = \
 	src/nmtui/nmtui-edit.h \
 	src/nmtui/nmtui-hostname.c \
 	src/nmtui/nmtui-hostname.h \
+	src/nmtui/nmtui-radio.c \
+	src/nmtui/nmtui-radio.h \
 	\
 	src/nmtui/nm-editor-bindings.c \
 	src/nmtui/nm-editor-bindings.h \
@@ -5417,12 +5427,14 @@ src/nm-cloud-setup/nm-cloud-setup.service: $(srcdir)/src/nm-cloud-setup/nm-cloud
 	$(AM_V_GEN) $(data_edit) $< >$@
 
 install-data-hook-cloud-setup: install-data-hook-dispatcher
-	$(INSTALL_SCRIPT) "$(srcdir)/src/nm-cloud-setup/90-nm-cloud-setup.sh" "$(DESTDIR)$(nmlibdir)/dispatcher.d/no-wait.d/"
+	$(INSTALL_SCRIPT) "$(srcdir)/src/nm-cloud-setup/90-nm-cloud-setup.sh" "$(DESTDIR)$(nmlibdir)/dispatcher.d/pre-up.d/"
+	ln -fs ../pre-up.d/90-nm-cloud-setup.sh "$(DESTDIR)$(nmlibdir)/dispatcher.d/no-wait.d/90-nm-cloud-setup.sh"
 	ln -fs no-wait.d/90-nm-cloud-setup.sh "$(DESTDIR)$(nmlibdir)/dispatcher.d/90-nm-cloud-setup.sh"
 
 install_data_hook += install-data-hook-cloud-setup
 
 uninstall-hook-cloud-setup:
+	rm -f "$(DESTDIR)$(nmlibdir)/dispatcher.d/pre-up.d/90-nm-cloud-setup.sh"
 	rm -f "$(DESTDIR)$(nmlibdir)/dispatcher.d/no-wait.d/90-nm-cloud-setup.sh"
 	rm -f "$(DESTDIR)$(nmlibdir)/dispatcher.d/90-nm-cloud-setup.sh"
 

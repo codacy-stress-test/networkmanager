@@ -8,7 +8,7 @@ dnl    "shared/nm-version-macros.h.in"
 dnl  - update number in meson.build
 m4_define([nm_major_version], [1])
 m4_define([nm_minor_version], [43])
-m4_define([nm_micro_version], [9])
+m4_define([nm_micro_version], [10])
 m4_define([nm_version],
           [nm_major_version.nm_minor_version.nm_micro_version])
 
@@ -754,10 +754,12 @@ fi
 AC_SUBST(DBUS_SYS_DIR)
 
 # pppd
+NM_PPP_VERSION_2_5_OR_NEWER=0
 PPPD_VERSION=2.4.9
 PKG_CHECK_EXISTS([pppd], [
 	PPPD_VERSION=`$PKG_CONFIG --modversion pppd`
 	PPPD_CFLAGS=`$PKG_CONFIG --cflags pppd`
+	NM_PPP_VERSION_2_5_OR_NEWER=1
 ])
 
 AC_ARG_ENABLE(ppp,
@@ -783,6 +785,7 @@ else
 	PPPD_PLUGIN_DIR="${libdir}/pppd/$PPPD_VERSION"
 fi
 AC_SUBST(PPPD_PLUGIN_DIR)
+AC_DEFINE_UNQUOTED(NM_PPP_VERSION_2_5_OR_NEWER, $NM_PPP_VERSION_2_5_OR_NEWER, [The detected ppp API version])
 
 AC_ARG_WITH(pppd, AS_HELP_STRING([--with-pppd=/path/to/pppd], [path to pppd binary]))
 if test "x${with_pppd}" = x; then
