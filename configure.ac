@@ -120,6 +120,9 @@ AC_CHECK_DECLS([
 ]])
 
 AC_CHECK_HEADERS(sys/auxv.h)
+AC_CHECK_HEADERS(threads.h,
+                 [],
+                 [AC_DEFINE([HAVE_THREADS_H], [0], [Define to 1 if you have the <threads.h> header file.])])
 
 AC_CHECK_DECLS([getrandom],
                [AC_DEFINE([USE_SYS_RANDOM_H], [1], [sys/random.h is usable])
@@ -169,10 +172,9 @@ AC_SUBST(nmrundir, '${runstatedir}'/$PACKAGE, [NetworkManager runtime state dire
 AC_CHECK_FUNCS([__secure_getenv secure_getenv])
 
 # Alternative configuration plugins
-AC_ARG_ENABLE(ifcfg-rh, AS_HELP_STRING([--enable-ifcfg-rh], [enable ifcfg-rh configuration plugin (Fedora/RHEL)]))
+AC_ARG_ENABLE(ifcfg-rh, AS_HELP_STRING([--enable-ifcfg-rh], [enable ifcfg-rh configuration plugin (Fedora/RHEL) (deprecated)]))
 AC_ARG_ENABLE(ifupdown, AS_HELP_STRING([--enable-ifupdown], [enable ifupdown configuration plugin (Debian/Ubuntu)]))
 # Default alternative plugins by distribution
-AS_IF([test -z "$enable_ifcfg_rh" -a -d /etc/sysconfig/network-scripts], enable_ifcfg_rh=yes)
 AS_IF([test -z "$enable_ifupdown" -a -f /etc/debian_version],            enable_ifupdown=yes)
 # Otherwise, plugins default to "no"
 AS_IF([test -z "$enable_ifcfg_rh"], enable_ifcfg_rh=no)

@@ -104,6 +104,7 @@ endforeach
 
 # headers
 config_h.set10('HAVE_SYS_AUXV_H', cc.has_header('sys/auxv.h'))
+config_h.set10('HAVE_THREADS_H', cc.has_header('threads.h'))
 
 use_sys_random = cc.has_function('getrandom', prefix: '#include <sys/random.h>')
 config_h.set10('USE_SYS_RANDOM_H', use_sys_random)
@@ -288,11 +289,6 @@ glib_dep = declare_dependency(
 )
 
 enable_ifcfg_rh = get_option('ifcfg_rh')
-if enable_ifcfg_rh == 'auto'
-  enable_ifcfg_rh = (run_command('test', '-e', '/etc/sysconfig/network-scripts').returncode() == 0)
-else
-  enable_ifcfg_rh = (enable_ifcfg_rh != 'false')
-endif
 
 enable_ifupdown = get_option('ifupdown')
 if enable_ifupdown == 'auto'
